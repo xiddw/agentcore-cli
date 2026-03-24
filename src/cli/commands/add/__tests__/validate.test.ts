@@ -17,13 +17,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mockReadProjectSpec = vi.fn();
 const mockConfigExists = vi.fn().mockReturnValue(true);
-const mockReadMcpSpec = vi.fn();
 
 vi.mock('../../../../lib/index.js', () => ({
   ConfigIO: class {
     readProjectSpec = mockReadProjectSpec;
     configExists = mockConfigExists;
-    readMcpSpec = mockReadMcpSpec;
   },
   findConfigRoot: vi.fn().mockReturnValue('/mock/project/agentcore'),
 }));
@@ -337,7 +335,7 @@ describe('validate', () => {
   describe('validateAddGatewayTargetOptions', () => {
     beforeEach(() => {
       // By default, mock that the gateway from validGatewayTargetOptions exists
-      mockReadMcpSpec.mockResolvedValue({ agentCoreGateways: [{ name: 'my-gateway' }] });
+      mockReadProjectSpec.mockResolvedValue({ agentCoreGateways: [{ name: 'my-gateway' }] });
     });
 
     // AC15: Required fields validated
@@ -356,7 +354,7 @@ describe('validate', () => {
     });
 
     it('returns error when no gateways exist', async () => {
-      mockReadMcpSpec.mockResolvedValue({ agentCoreGateways: [] });
+      mockReadProjectSpec.mockResolvedValue({ agentCoreGateways: [] });
       const result = await validateAddGatewayTargetOptions({ ...validGatewayTargetOptions });
       expect(result.valid).toBe(false);
       expect(result.error).toContain('No gateways found');
@@ -364,7 +362,7 @@ describe('validate', () => {
     });
 
     it('returns error when specified gateway does not exist', async () => {
-      mockReadMcpSpec.mockResolvedValue({ agentCoreGateways: [{ name: 'other-gateway' }] });
+      mockReadProjectSpec.mockResolvedValue({ agentCoreGateways: [{ name: 'other-gateway' }] });
       const result = await validateAddGatewayTargetOptions({ ...validGatewayTargetOptions });
       expect(result.valid).toBe(false);
       expect(result.error).toContain('Gateway "my-gateway" not found');
@@ -470,6 +468,7 @@ describe('validate', () => {
     // AC21: credential validation through outbound auth
     it('returns error when credential not found', async () => {
       mockReadProjectSpec.mockResolvedValue({
+        agentCoreGateways: [{ name: 'my-gateway' }],
         credentials: [{ name: 'existing-cred', type: 'ApiKey' }],
       });
 
@@ -488,6 +487,7 @@ describe('validate', () => {
 
     it('returns error when no credentials configured', async () => {
       mockReadProjectSpec.mockResolvedValue({
+        agentCoreGateways: [{ name: 'my-gateway' }],
         credentials: [],
       });
 
@@ -506,6 +506,7 @@ describe('validate', () => {
 
     it('passes when credential exists', async () => {
       mockReadProjectSpec.mockResolvedValue({
+        agentCoreGateways: [{ name: 'my-gateway' }],
         credentials: [{ name: 'valid-cred', type: 'ApiKey' }],
       });
 

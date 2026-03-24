@@ -1,5 +1,11 @@
 import { findConfigRoot, setEnvVar } from '../../lib';
-import type { AgentCoreGateway, AgentCoreGatewayTarget, AgentCoreMcpSpec, GatewayAuthorizerType } from '../../schema';
+import type {
+  AgentCoreGateway,
+  AgentCoreGatewayTarget,
+  AgentCoreMcpSpec,
+  AgentCoreProjectSpec,
+  GatewayAuthorizerType,
+} from '../../schema';
 import { AgentCoreGatewaySchema, PolicyEngineModeSchema } from '../../schema';
 import type { AddGatewayOptions as CLIAddGatewayOptions } from '../commands/add/types';
 import { validateAddGatewayOptions } from '../commands/add/validate';
@@ -32,10 +38,18 @@ export interface AddGatewayOptions {
   policyEngineMode?: string;
 }
 
+/** Extract MCP-related fields from a project spec. */
+function extractMcpSpec(project: AgentCoreProjectSpec): AgentCoreMcpSpec {
+  return {
+    agentCoreGateways: project.agentCoreGateways,
+    mcpRuntimeTools: project.mcpRuntimeTools,
+    unassignedTargets: project.unassignedTargets,
+  };
+}
+
 /**
  * GatewayPrimitive handles all gateway add/remove operations.
  * Absorbs logic from create-mcp.ts (gateway) and remove-gateway.ts.
- * Uses mcp.json instead of agentcore.json.
  */
 export class GatewayPrimitive extends BasePrimitive<AddGatewayOptions, RemovableResource> {
   readonly kind = 'gateway';
@@ -54,7 +68,8 @@ export class GatewayPrimitive extends BasePrimitive<AddGatewayOptions, Removable
 
   async remove(gatewayName: string): Promise<RemovalResult> {
     try {
-      const mcpSpec = await this.configIO.readMcpSpec();
+      const project = await this.readProjectSpec();
+      const mcpSpec = extractMcpSpec(project);
 
       const gateway = mcpSpec.agentCoreGateways.find(g => g.name === gatewayName);
       if (!gateway) {
@@ -62,7 +77,7 @@ export class GatewayPrimitive extends BasePrimitive<AddGatewayOptions, Removable
       }
 
       const newMcpSpec = this.computeRemovedGatewayMcpSpec(mcpSpec, gatewayName);
-      await this.configIO.writeMcpSpec(newMcpSpec);
+      await this.writeProjectSpec({ ...project, ...newMcpSpec });
 
       return { success: true };
     } catch (err) {
@@ -72,7 +87,8 @@ export class GatewayPrimitive extends BasePrimitive<AddGatewayOptions, Removable
   }
 
   async previewRemove(gatewayName: string): Promise<RemovalPreview> {
-    const mcpSpec = await this.configIO.readMcpSpec();
+    const project = await this.readProjectSpec();
+    const mcpSpec = extractMcpSpec(project);
 
     const gateway = mcpSpec.agentCoreGateways.find(g => g.name === gatewayName);
     if (!gateway) {
@@ -88,9 +104,9 @@ export class GatewayPrimitive extends BasePrimitive<AddGatewayOptions, Removable
 
     const afterMcpSpec = this.computeRemovedGatewayMcpSpec(mcpSpec, gatewayName);
     schemaChanges.push({
-      file: 'agentcore/mcp.json',
-      before: mcpSpec,
-      after: afterMcpSpec,
+      file: 'agentcore/agentcore.json',
+      before: project,
+      after: { ...project, ...afterMcpSpec },
     });
 
     return { summary, directoriesToDelete: [], schemaChanges };
@@ -98,11 +114,8 @@ export class GatewayPrimitive extends BasePrimitive<AddGatewayOptions, Removable
 
   async getRemovable(): Promise<RemovableResource[]> {
     try {
-      if (!this.configIO.configExists('mcp')) {
-        return [];
-      }
-      const mcpSpec = await this.configIO.readMcpSpec();
-      return mcpSpec.agentCoreGateways.map(g => ({ name: g.name }));
+      const project = await this.readProjectSpec();
+      return project.agentCoreGateways.map(g => ({ name: g.name }));
     } catch {
       return [];
     }
@@ -113,26 +126,20 @@ export class GatewayPrimitive extends BasePrimitive<AddGatewayOptions, Removable
    */
   async getExistingGateways(): Promise<string[]> {
     try {
-      if (!this.configIO.configExists('mcp')) {
-        return [];
-      }
-      const mcpSpec = await this.configIO.readMcpSpec();
-      return mcpSpec.agentCoreGateways.map(g => g.name);
+      const project = await this.readProjectSpec();
+      return project.agentCoreGateways.map(g => g.name);
     } catch {
       return [];
     }
   }
 
   /**
-   * Get list of unassigned targets from mcp.json.
+   * Get list of unassigned targets from agentcore.json.
    */
   async getUnassignedTargets(): Promise<AgentCoreGatewayTarget[]> {
     try {
-      if (!this.configIO.configExists('mcp')) {
-        return [];
-      }
-      const mcpSpec = await this.configIO.readMcpSpec();
-      return mcpSpec.unassignedTargets ?? [];
+      const project = await this.readProjectSpec();
+      return project.unassignedTargets ?? [];
     } catch {
       return [];
     }
@@ -339,27 +346,25 @@ export class GatewayPrimitive extends BasePrimitive<AddGatewayOptions, Removable
    * Create a gateway (absorbed from create-mcp.ts createGatewayFromWizard).
    */
   private async createGatewayFromWizard(config: AddGatewayConfig): Promise<{ name: string }> {
-    const mcpSpec: AgentCoreMcpSpec = this.configIO.configExists('mcp')
-      ? await this.configIO.readMcpSpec()
-      : { agentCoreGateways: [] };
+    const project = await this.readProjectSpec();
 
-    if (mcpSpec.agentCoreGateways.some(g => g.name === config.name)) {
+    if (project.agentCoreGateways.some(g => g.name === config.name)) {
       throw new Error(`Gateway "${config.name}" already exists.`);
     }
 
     // Move selected unassigned targets to the new gateway
     const selectedNames = new Set(config.selectedTargets ?? []);
     const movedTargets: AgentCoreGatewayTarget[] = [];
-    if (selectedNames.size > 0 && mcpSpec.unassignedTargets) {
+    if (selectedNames.size > 0 && project.unassignedTargets) {
       const remaining: AgentCoreGatewayTarget[] = [];
-      for (const target of mcpSpec.unassignedTargets) {
+      for (const target of project.unassignedTargets) {
         if (selectedNames.has(target.name)) {
           movedTargets.push(target);
         } else {
           remaining.push(target);
         }
       }
-      mcpSpec.unassignedTargets = remaining.length > 0 ? remaining : undefined;
+      project.unassignedTargets = remaining.length > 0 ? remaining : undefined;
     }
 
     const gateway: AgentCoreGateway = {
@@ -373,8 +378,8 @@ export class GatewayPrimitive extends BasePrimitive<AddGatewayOptions, Removable
       policyEngineConfiguration: config.policyEngineConfiguration,
     };
 
-    mcpSpec.agentCoreGateways.push(gateway);
-    await this.configIO.writeMcpSpec(mcpSpec);
+    project.agentCoreGateways.push(gateway);
+    await this.writeProjectSpec(project);
 
     // Auto-create OAuth credential if client credentials are provided
     if (config.jwtConfig?.clientId && config.jwtConfig?.clientSecret) {
