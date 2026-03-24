@@ -3,6 +3,7 @@ import {
   hasAwsCredentials,
   parseJsonOutput,
   prereqs,
+  retry,
   spawnAndCollect,
 } from '../src/test-utils/index.js';
 import {
@@ -32,24 +33,6 @@ interface E2EConfig {
   modelProvider: string;
   requiredEnvVar?: string;
   build?: string;
-}
-
-/**
- * Retry an async function up to `times` attempts with a delay between retries.
- */
-async function retry<T>(fn: () => Promise<T>, times: number, delayMs: number): Promise<T> {
-  let lastError: unknown;
-  for (let i = 0; i < times; i++) {
-    try {
-      return await fn();
-    } catch (err) {
-      lastError = err;
-      if (i < times - 1) {
-        await new Promise(resolve => setTimeout(resolve, delayMs));
-      }
-    }
-  }
-  throw lastError;
 }
 
 export function createE2ESuite(cfg: E2EConfig) {
@@ -202,6 +185,122 @@ export function createE2ESuite(cfg: E2EConfig) {
         );
       },
       180000
+    );
+
+    // ── Post-deploy observability tests ──────────────────────────────
+    // Use spawnAndCollect directly to avoid TypeScript inference depth limits
+    // in the describe.sequential callback.
+    const run = (args: string[]) => spawnAndCollect('agentcore', args, projectPath);
+
+    // Track the runtime ID across status tests
+    let runtimeId: string;
+
+    it.skipIf(!canRun)(
+      'status shows the deployed agent',
+      async () => {
+        const result = await run(['status', '--json']);
+
+        expect(result.exitCode, `Status failed: ${result.stderr}`).toBe(0);
+
+        const json = parseJsonOutput(result.stdout) as {
+          success: boolean;
+          resources: {
+            resourceType: string;
+            name: string;
+            deploymentState: string;
+            identifier?: string;
+          }[];
+        };
+        expect(json.success).toBe(true);
+
+        const agent = json.resources.find(r => r.resourceType === 'agent' && r.name === agentName);
+        expect(agent, `Agent "${agentName}" should appear in status`).toBeDefined();
+        expect(agent!.deploymentState).toBe('deployed');
+        expect(agent!.identifier, 'Deployed agent should have a runtime ARN').toBeTruthy();
+
+        // Extract runtime ID from ARN (e.g. arn:aws:...:agent-runtime/XXXXX → XXXXX)
+        runtimeId = agent!.identifier!.split('/').pop()!;
+      },
+      120000
+    );
+
+    it.skipIf(!canRun)(
+      'status looks up agent runtime by ID',
+      async () => {
+        expect(runtimeId, 'Runtime ID should have been extracted from status').toBeTruthy();
+
+        const result = await run(['status', '--agent-runtime-id', runtimeId, '--json']);
+
+        expect(result.exitCode, `Runtime lookup failed: ${result.stderr}`).toBe(0);
+
+        const json = parseJsonOutput(result.stdout) as {
+          success: boolean;
+          runtimeId?: string;
+          runtimeStatus?: string;
+        };
+        expect(json.success).toBe(true);
+        expect(json.runtimeId).toBe(runtimeId);
+        expect(json.runtimeStatus).toBeTruthy();
+      },
+      120000
+    );
+
+    it.skipIf(!canRun)(
+      'logs returns entries from the invocation',
+      async () => {
+        await retry(
+          async () => {
+            // --since 1h triggers search mode (avoids live tail)
+            const result = await run(['logs', '--agent', agentName, '--since', '1h', '--json']);
+
+            expect(result.exitCode, `Logs failed: ${result.stderr}`).toBe(0);
+
+            // logs --json outputs JSON Lines (one {timestamp, message} per line)
+            const lines: { timestamp: string; message: string }[] = result.stdout
+              .split('\n')
+              .filter((l: string) => l.trim())
+              .map((l: string) => JSON.parse(l) as { timestamp: string; message: string });
+
+            expect(lines.length, 'Should have at least one log entry').toBeGreaterThan(0);
+            for (const line of lines) {
+              expect(line.timestamp, 'Each log entry should have a timestamp').toBeTruthy();
+              expect(line.message, 'Each log entry should have a message').toBeTruthy();
+            }
+          },
+          3,
+          15000
+        );
+      },
+      120000
+    );
+
+    it.skipIf(!canRun)(
+      'logs supports level filtering',
+      async () => {
+        // --level error should succeed even if no error-level logs exist
+        const result = await run(['logs', '--agent', agentName, '--since', '1h', '--level', 'error', '--json']);
+
+        expect(result.exitCode, `Logs --level failed: ${result.stderr}`).toBe(0);
+      },
+      120000
+    );
+
+    it.skipIf(!canRun)(
+      'traces list succeeds after invocation',
+      async () => {
+        // traces list has no --json flag — verify exit code and non-empty output
+        await retry(
+          async () => {
+            const result = await run(['traces', 'list', '--agent', agentName, '--since', '1h']);
+
+            expect(result.exitCode, `Traces list failed (stderr: ${result.stderr})`).toBe(0);
+            expect(result.stdout.length, 'Traces list should produce output').toBeGreaterThan(0);
+          },
+          3,
+          15000
+        );
+      },
+      120000
     );
   });
 }
